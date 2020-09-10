@@ -27,7 +27,20 @@ const (
 	dsn = "host=localhost port=5434 user=distlock dbname=distlock sslmode=disable"
 )
 
-func Test_Manager(t *testing.T) {
+func stopDB(t *testing.T) {
+	// a command to rip down postgres unexpectedly
+	cmd := exec.Command(
+		"docker-compose",
+		"down",
+	)
+	err := cmd.Run()
+	if err != nil {
+		t.Fatalf("could not rip database down: %v", err)
+	}
+	log.Printf("db down")
+}
+
+func startDB(t *testing.T) {
 	// a command to start local postgres instance
 	cmd := exec.Command(
 		"docker-compose",
@@ -38,8 +51,10 @@ func Test_Manager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start the local postgres instance: %v", err)
 	}
+	log.Printf("db started")
+}
 
-	// spin in db becoming available
+func waitDB(t *testing.T) {
 	up := false
 	conf, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -56,14 +71,54 @@ func Test_Manager(t *testing.T) {
 		up = true
 		conn.Close(tctx)
 	}
+	log.Printf("db up")
+}
+
+func Test_Manager(t *testing.T) {
+	startDB(t)
+	waitDB(t)
 
 	test_SingleSessionMutualExclusion(t)
 	test_MultiSessionMutualExclusion(t)
 	test_TryLockSingleSession(t)
 	test_TryLockMultiSession(t)
 	test_ProcessDeath(t)
+	test_DBFlap(t)
 	// should be last test, it rips down the local db
 	test_DBFailure(t)
+}
+
+func test_DBFlap(t *testing.T) {
+	// get a lock
+	ctx := context.Background()
+	manager, err := NewManager(ctx, dsn)
+
+	key := "test-key"
+	_, err = manager.Lock(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stopDB(t)
+
+	// make sure we get an error trying to get a lock
+	_, err = manager.Lock(key)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	startDB(t)
+	waitDB(t)
+
+	log.Printf("sleeping...")
+	time.Sleep(1 * time.Second)
+	log.Printf("done sleeping...")
+
+	// make sure we dont get an error getting a lock
+	_, err = manager.Lock(key)
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // this is a hack of a test, but you can run this, then ctrl-c on the command line
@@ -75,22 +130,11 @@ func test_ProcessDeathManual(t *testing.T) {
 		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
 	)
 
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-
 	ctx := context.Background()
-	manager0 := NewManager(ctx, conn0)
+	manager, err := NewManager(ctx, dsn)
 
 	key := "test-key"
-	_, err = manager0.Lock(ctx, key)
+	_, err = manager.Lock(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,69 +147,66 @@ func test_ProcessDeath(t *testing.T) {
 		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
 	)
 
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
+	tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	conf, err := pgx.ParseConfig(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
+	mctx, mCancel := context.WithCancel(context.Background())
+	manager, err := NewManager(mctx, dsn)
+
+	// take some locks
+	keys := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
+	for _, key := range keys {
+		_, err = manager.Lock(key)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	ctx := context.Background()
-	manager0 := NewManager(ctx, conn0)
-
-	key := "test-key"
-	_, err = manager0.Lock(ctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// forceable close the connection simulating process
-	// death
-	err = manager0.close(ctx)
-	if err == nil {
-		t.Fatal("expected error when force closing channel")
-	}
-
+	// confirm locks in db
+	tctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	conn1, err := pgx.ConnectConfig(tctx, conf)
 	if err != nil {
 		t.Fatalf("failed to connect to postgres: %v", err)
 	}
 
 	var i int
-	row := conn1.QueryRow(ctx, query)
+
+	row := conn1.QueryRow(context.Background(), query)
 	err = row.Scan(&i)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if i > 0 {
-		t.Fatal("lock still exists in db")
+	if i != len(keys) {
+		t.Fatalf("got: %v want: %v", i, len(keys))
+	}
+
+	// cancel manager ctx, should drop all locks
+	mCancel()
+	time.Sleep(100 * time.Millisecond)
+
+	row = conn1.QueryRow(context.Background(), query)
+	err = row.Scan(&i)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if i != 0 {
+		t.Fatalf("got: %v want: %v", i, 0)
 	}
 }
 
 func test_TryLockMultiSession(t *testing.T) {
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
 	ctx := context.Background()
-	manager0 := NewManager(ctx, conn0)
+	manager0, err := NewManager(ctx, dsn)
 
-	conn1, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
 	ctx = context.Background()
-	manager1 := NewManager(ctx, conn1)
+	manager1, err := NewManager(ctx, dsn)
 
 	key := "test-key0"
 
@@ -176,7 +217,7 @@ func test_TryLockMultiSession(t *testing.T) {
 	// launch goroutine that will acquire lock and unlock
 	// in some time
 	go func() {
-		_, err := manager0.Lock(ctx, key)
+		_, err := manager0.Lock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -187,7 +228,7 @@ func test_TryLockMultiSession(t *testing.T) {
 		log.Printf("goroutine 0 acquired lock. sleeping for 5 seconds before unlock")
 
 		time.Sleep(5 * time.Second)
-		err = manager0.Unlock(ctx, key)
+		err = manager0.Unlock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -211,7 +252,7 @@ func test_TryLockMultiSession(t *testing.T) {
 	cancel()
 
 	tctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	err = manager1.Unlock(ctx, key)
+	err = manager1.Unlock(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,17 +261,8 @@ func test_TryLockMultiSession(t *testing.T) {
 }
 
 func test_TryLockSingleSession(t *testing.T) {
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
 	ctx := context.Background()
-	manager := NewManager(ctx, conn0)
+	manager, err := NewManager(ctx, dsn)
 
 	key := "test-key0"
 
@@ -241,7 +273,7 @@ func test_TryLockSingleSession(t *testing.T) {
 	// launch goroutine that will acquire lock and unlock
 	// in some time
 	go func() {
-		_, err := manager.Lock(ctx, key)
+		_, err := manager.Lock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +284,7 @@ func test_TryLockSingleSession(t *testing.T) {
 		log.Printf("goroutine 0 acquired lock. sleeping for 5 seconds before unlock")
 
 		time.Sleep(5 * time.Second)
-		err = manager.Unlock(ctx, key)
+		err = manager.Unlock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -276,7 +308,7 @@ func test_TryLockSingleSession(t *testing.T) {
 	cancel()
 
 	tctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	err = manager.Unlock(ctx, key)
+	err = manager.Unlock(key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,30 +317,17 @@ func test_TryLockSingleSession(t *testing.T) {
 }
 
 func test_DBFailure(t *testing.T) {
-	// a command to rip down postgres unexpectedly
-	cmd := exec.Command(
-		"docker-compose",
-		"down",
-	)
-
 	// create some locks
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
+	keys := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
+	ctx, _ := context.WithCancel(context.Background())
+	manager, err := NewManager(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-
-	locks := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
-	ctx, _ := context.WithCancel(context.Background())
-	manager := NewManager(ctx, conn0)
 
 	var wg sync.WaitGroup
-	for _, lock := range locks {
-		ctx, err := manager.Lock(ctx, lock)
+	for _, key := range keys {
+		ctx, err := manager.Lock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -322,11 +341,7 @@ func test_DBFailure(t *testing.T) {
 	}
 
 	// rip database down
-	err = cmd.Run()
-	if err != nil {
-		t.Fatalf("could not rip database down: %v", err)
-	}
-
+	stopDB(t)
 	wg.Wait()
 }
 
@@ -353,8 +368,8 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 	}
 
 	ctx, _ := context.WithCancel(context.Background())
-	manager0 := NewManager(ctx, conn0)
-	manager1 := NewManager(ctx, conn1)
+	manager0, err := NewManager(ctx, dsn)
+	manager1, err := NewManager(ctx, dsn)
 
 	// test mutual exclusion
 	key := "test-key"
@@ -365,7 +380,7 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, err := manager0.Lock(ctx, key)
+		_, err := manager0.Lock(key)
 		if err != nil {
 			if err == ErrMutualExclusion {
 				log.Printf("go routine %d lost the race", 0)
@@ -382,7 +397,7 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		_, err := manager1.Lock(ctx, key)
+		_, err := manager1.Lock(key)
 		if err != nil {
 			if err == ErrMutualExclusion {
 				log.Printf("go routine %d lost the race", 1)
@@ -402,12 +417,12 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 		count++
 		// go routine 0 informed us it acquired the lock.
 		// attempt unlock and check error
-		err = manager0.Unlock(ctx, key)
+		err = manager0.Unlock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// a subsequent call to unlock should fail.
-		err = manager0.Unlock(ctx, key)
+		err = manager0.Unlock(key)
 		if err == nil {
 			t.Fatal(err)
 		}
@@ -416,12 +431,12 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 		count++
 		// go routine 1 informed us it acquired the lock.
 		// attempt unlock and check error
-		err = manager1.Unlock(ctx, key)
+		err = manager1.Unlock(key)
 		if err != nil {
 			t.Fatal(err)
 		}
 		// a subsequent call to unlock should fail.
-		err = manager1.Unlock(ctx, key)
+		err = manager1.Unlock(key)
 		if err == nil {
 			t.Fatal(err)
 		}
@@ -449,7 +464,7 @@ func test_SingleSessionMutualExclusion(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	manager := NewManager(ctx, conn)
+	manager, err := NewManager(ctx, dsn)
 
 	// test mutual exclusion
 	key := "test-key"
@@ -459,7 +474,7 @@ func test_SingleSessionMutualExclusion(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := manager.Lock(ctx, key)
+			_, err := manager.Lock(key)
 			if err != nil {
 				if err == ErrMutualExclusion {
 					log.Printf("go routine %d lost the race", ii)
@@ -473,7 +488,7 @@ func test_SingleSessionMutualExclusion(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	err = manager.Unlock(ctx, key)
+	err = manager.Unlock(key)
 	if err != nil {
 		t.Fatal(err)
 	}

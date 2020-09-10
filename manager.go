@@ -3,122 +3,91 @@ package distlock
 import (
 	"context"
 	"fmt"
-	"hash/fnv"
-	"io"
-	"log"
 	"time"
 
 	"github.com/jackc/pgx/v4"
 )
 
-const (
-	trySessionLock   = `SELECT pg_try_advisory_lock($1);`
-	trySessionUnlock = `SELECT pg_advisory_unlock($1)`
-)
-
-func keyify(key string) int64 {
-	h := fnv.New64a()
-	io.WriteString(h, key)
-	return int64(h.Sum64())
-}
-
-type RequestType int
-
-const (
-	Invalid RequestType = iota
-	Lock
-	Unlock
-	// this forces a close of the underlying conn.
-	// this should only be used for testing.
-	Close
-)
-
-var ErrMutualExclusion = fmt.Errorf("another process is holding the requested lock")
-
-// response is an internal response for a
-// lock request
-type response struct {
-	ok  bool
-	ctx context.Context
-	err error
-}
-
-// request is an internal request for a lock
-type request struct {
-	t        RequestType
-	key      string
-	respChan chan response
-}
-
+// Manager provides a client facing api for obtaining and returning
+// distributed locks.
+//
+// Manager must not be copied after construction.
 type Manager struct {
-	root    context.Context
-	cancel  context.CancelFunc
-	m       map[string]context.CancelFunc
-	conn    *pgx.Conn
-	reqChan chan request
+	// Guard provides a concurrency safe request/response api with
+	// guarentees against deadlocks and races.
+	g *guard
 }
 
-func NewManager(ctx context.Context, conn *pgx.Conn) *Manager {
+func NewManager(ctx context.Context, dsn string) (*Manager, error) {
 	reqChan := make(chan request, 1024)
 	m := make(map[string]context.CancelFunc)
+
+	conf, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := pgx.ConnectConfig(ctx, conf)
+	if err != nil {
+		return nil, err
+	}
+
 	root, cancel := context.WithCancel(ctx)
 
-	mgr := &Manager{
+	g := &guard{
 		root:    root,
 		cancel:  cancel,
+		reqChan: reqChan,
+		dsn:     dsn,
 		m:       m,
 		conn:    conn,
-		reqChan: reqChan,
 	}
+	g.online.Store(true)
+	go g.ioLoop(g.root)
 
-	go mgr.Guard(ctx)
-	return mgr
+	return &Manager{
+		g: g,
+	}, nil
 }
 
-// Guard provides a channel-based memory guard
-// that serializes access to internal data structures
-// not concurrency safe.
-//
-// this guard performs database health checks on an interval.
-// if database becomes unavailable all lock ctx(s) are canceled.
-//
-// if the original ctx controlling the manager's lifetime is canceled
-// the manager sets reqChan to nil and is no longer useable.
-func (m *Manager) Guard(ctx context.Context) {
-	t := time.NewTicker(50 * time.Millisecond)
-	for {
-		select {
-		case <-t.C:
-			m.checkDB(ctx)
-		case req := <-m.reqChan:
-			switch req.t {
-			case Invalid:
-				continue
-			case Lock:
-				resp := m.lock(ctx, req.key)
-				req.respChan <- resp
-			case Unlock:
-				resp := m.unlock(ctx, req.key)
-				req.respChan <- resp
-			case Close:
-				var resp response
-				resp.err = m.conn.Close(ctx)
-				t.Stop()
-				m.cancel()
-				m.reqChan = nil
-			}
-		case <-ctx.Done():
-			log.Printf("manager's ctx canceled. canceling all locks")
-			for key, f := range m.m {
-				log.Printf("canceling lock for key %s", key)
-				f()
-			}
-			t.Stop()
-			m.cancel()
-			m.reqChan = nil
-			return
-		}
+func (m *Manager) Lock(key string) (context.Context, error) {
+	c := make(chan response)
+	req := request{
+		t:        Lock,
+		key:      key,
+		respChan: c,
 	}
+
+	if !m.g.online.Load().(bool) {
+		return nil, ErrDatabaseUnavailable
+	}
+
+	resp := m.g.request(req)
+
+	if !resp.ok {
+		return nil, resp.err
+	}
+	return resp.ctx, nil
+}
+
+func (m *Manager) Unlock(key string) error {
+	c := make(chan response)
+	req := request{
+		t:        Unlock,
+		key:      key,
+		respChan: c,
+	}
+
+	if !m.g.online.Load().(bool) {
+		return ErrDatabaseUnavailable
+	}
+
+	resp := m.g.request(req)
+
+	if !resp.ok {
+		return resp.err
+	}
+	return nil
 }
 
 // TryLock will block on acquiring a lock until either success or the provided ctx
@@ -135,20 +104,12 @@ func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, err
 			key:      key,
 			respChan: c,
 		}
-		select {
-		case m.reqChan <- req:
-		default:
-			return nil, fmt.Errorf("manager could not take request. construct a new one")
+
+		if !m.g.online.Load().(bool) {
+			return nil, ErrDatabaseUnavailable
 		}
 
-		// block until response or ctx canceled
-		var resp response
-		select {
-		case resp = <-c:
-		case <-m.root.Done():
-			return nil, fmt.Errorf("manager's context canceled while waiting for lock")
-		}
-
+		resp := m.g.request(req)
 		// lock acquired
 		if resp.ok {
 			return resp.ctx, nil
@@ -160,133 +121,5 @@ func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, err
 			continue
 		}
 		return nil, resp.err
-	}
-}
-
-func (m *Manager) Lock(ctx context.Context, key string) (context.Context, error) {
-	c := make(chan response)
-	req := request{
-		t:        Lock,
-		key:      key,
-		respChan: c,
-	}
-	select {
-	case m.reqChan <- req:
-	default:
-		return nil, fmt.Errorf("manager could not take request. construct a new one")
-	}
-
-	// block until response
-	var resp response
-	select {
-	case <-m.root.Done():
-		return nil, fmt.Errorf("manager's ctx canceled while waiting for lock")
-	case resp = <-c:
-	}
-
-	if !resp.ok {
-		return nil, resp.err
-	}
-	return resp.ctx, nil
-}
-
-func (m *Manager) Unlock(ctx context.Context, key string) error {
-	c := make(chan response)
-	req := request{
-		t:        Unlock,
-		key:      key,
-		respChan: c,
-	}
-	select {
-	case m.reqChan <- req:
-	default:
-		return fmt.Errorf("manager could not take request. construct a new one")
-	}
-
-	// block until response
-	var resp response
-	select {
-	case <-m.root.Done():
-		return fmt.Errorf("manager's ctx canceled while waiting for lock")
-	case resp = <-c:
-	}
-
-	if !resp.ok {
-		return resp.err
-	}
-	return nil
-}
-
-func (m *Manager) close(ctx context.Context) error {
-	c := make(chan response)
-	req := request{
-		t:        Close,
-		respChan: c,
-	}
-	select {
-	case m.reqChan <- req:
-	default:
-		return fmt.Errorf("manager could not take request. construct a new one")
-	}
-
-	// block until response
-	var resp response
-	select {
-	case <-m.root.Done():
-		return fmt.Errorf("manager's ctx canceled while waiting for lock")
-	case resp = <-c:
-	}
-	return resp.err
-}
-
-func (m *Manager) lock(ctx context.Context, key string) response {
-	if _, ok := m.m[key]; ok {
-		return response{false, nil, ErrMutualExclusion}
-	}
-
-	var ok bool
-	row := m.conn.QueryRow(ctx, trySessionLock, keyify(key))
-	err := row.Scan(&ok)
-	if err != nil {
-		return response{false, nil, err}
-	}
-	if !ok {
-		return response{false, nil, ErrMutualExclusion}
-	}
-
-	// dervice ctx from root
-	ctx, cancel := context.WithCancel(m.root)
-	m.m[key] = cancel
-	return response{true, ctx, nil}
-}
-
-func (m *Manager) unlock(ctx context.Context, key string) response {
-	var f context.CancelFunc
-	var ok bool
-	if f, ok = m.m[key]; !ok {
-		return response{false, nil, fmt.Errorf("no existing lock for key %s found", key)}
-	}
-
-	row := m.conn.QueryRow(ctx, trySessionUnlock, keyify(key))
-	err := row.Scan(&ok)
-	if err != nil {
-		return response{false, nil, err}
-	}
-	if !ok {
-		return response{false, nil, fmt.Errorf("unlock of key %s returned false", key)}
-	}
-
-	f()
-	delete(m.m, key)
-	return response{true, nil, nil}
-}
-
-func (m *Manager) checkDB(ctx context.Context) {
-	if err := m.conn.Ping(ctx); err != nil {
-		for key, f := range m.m {
-			log.Printf("database unhealthy: %v. canceling lock for %s", err, key)
-			f()
-			delete(m.m, key)
-		}
 	}
 }
