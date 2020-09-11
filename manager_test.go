@@ -78,19 +78,32 @@ func Test_Manager(t *testing.T) {
 	startDB(t)
 	waitDB(t)
 
-	test_SingleSessionMutualExclusion(t)
-	test_MultiSessionMutualExclusion(t)
-	test_TryLockSingleSession(t)
-	test_TryLockMultiSession(t)
-	test_ProcessDeath(t)
-	test_DBFlap(t)
+	// concurrency bugs are intermittent. lets run
+	// these tests a bunch of times.
+
+	for i := 0; i < 9; i++ {
+		test_MultiSessionMutualExclusion(t)
+	}
+	for i := 0; i < 9; i++ {
+		test_TryLockSingleSession(t)
+	}
+	for i := 0; i < 9; i++ {
+		test_TryLockMultiSession(t)
+	}
+	for i := 0; i < 9; i++ {
+		test_ProcessDeath(t)
+	}
+	for i := 0; i < 9; i++ {
+		test_DBFlap(t)
+	}
 	// should be last test, it rips down the local db
 	test_DBFailure(t)
 }
 
 func test_DBFlap(t *testing.T) {
 	// get a lock
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 
 	key := "test-key"
@@ -130,7 +143,8 @@ func test_ProcessDeathManual(t *testing.T) {
 		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
 	)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 
 	key := "test-key"
@@ -202,10 +216,12 @@ func test_ProcessDeath(t *testing.T) {
 }
 
 func test_TryLockMultiSession(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager0, err := NewManager(ctx, dsn)
 
-	ctx = context.Background()
+	ctx, cancel = context.WithCancel(context.Background())
+	defer cancel()
 	manager1, err := NewManager(ctx, dsn)
 
 	key := "test-key0"
@@ -261,7 +277,8 @@ func test_TryLockMultiSession(t *testing.T) {
 }
 
 func test_TryLockSingleSession(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 
 	key := "test-key0"
@@ -319,7 +336,8 @@ func test_TryLockSingleSession(t *testing.T) {
 func test_DBFailure(t *testing.T) {
 	// create some locks
 	keys := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
-	ctx, _ := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +385,8 @@ func test_MultiSessionMutualExclusion(t *testing.T) {
 		t.Fatalf("conn is nil")
 	}
 
-	ctx, _ := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	manager0, err := NewManager(ctx, dsn)
 	manager1, err := NewManager(ctx, dsn)
 

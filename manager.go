@@ -43,6 +43,7 @@ func NewManager(ctx context.Context, dsn string) (*Manager, error) {
 		conn:    conn,
 	}
 	g.online.Store(true)
+	g.reconnecting.Store(false)
 	go g.ioLoop(g.root)
 
 	return &Manager{

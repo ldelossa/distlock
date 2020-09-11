@@ -26,6 +26,8 @@ var ErrMutualExclusion = fmt.Errorf("another process is holding the requested lo
 // requests can simply ignore this, their locks are gone.
 var ErrDatabaseUnavailable = fmt.Errorf("database currently unavailable.")
 
+var ErrCtxCanceled = fmt.Errorf("manager's ctx canceled. construct a new one.")
+
 func keyify(key string) int64 {
 	h := fnv.New64a()
 	io.WriteString(h, key)
@@ -67,7 +69,10 @@ type guard struct {
 	dsn     string
 	m       map[string]context.CancelFunc
 	conn    *pgx.Conn
-	online  atomic.Value
+	// atomic bool. true if the guard is not connected to the db.
+	online atomic.Value
+	// atomic bool. true if reconnection loop is running
+	reconnecting atomic.Value
 }
 
 // ioLoop is a serialized event loop.
@@ -81,8 +86,7 @@ func (m *guard) ioLoop(ctx context.Context) {
 	for {
 		select {
 		case <-t.C:
-			// if we aren't online don't try to Ping, we do not have
-			// exclusive access to m.conn
+			// only ping if we are online.
 			if m.online.Load().(bool) {
 				if err := m.conn.Ping(ctx); err != nil {
 					m.reconnect(ctx)
@@ -107,6 +111,7 @@ func (m *guard) reconnect(ctx context.Context) {
 	log.Printf("manager detected database disconnect... entering reconnection loop")
 
 	m.online.Store(false)
+	m.reconnecting.Store(true)
 
 	for key, f := range m.m {
 		log.Printf("database disconnected. canceling lock for %s", key)
@@ -114,16 +119,19 @@ func (m *guard) reconnect(ctx context.Context) {
 	}
 
 	go func(ctx context.Context) {
+		defer m.reconnecting.Store(false)
 		for {
 			if ctx.Err() != nil {
 				log.Printf("ctx canceled during reconnect loop.")
 				return
 			}
 
-			conn, err := pgx.Connect(ctx, m.dsn)
+			// if ctx canceled, this will fail, if not it'll create a natural
+			tctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+			conn, err := pgx.Connect(tctx, m.dsn)
+			cancel()
 			if err != nil {
 				log.Printf("database still unavailable...")
-				time.Sleep(1 * time.Second)
 				continue
 			}
 
@@ -161,11 +169,15 @@ func (m *guard) request(r request) response {
 
 // quit ensures graceful termination of the guard.
 func (m *guard) quit() {
+	for m.reconnecting.Load().(bool) {
+		// waiting for reconnect loop to quit.
+		// should be a short spin
+	}
+
 	// set offline. no new requests will enter the guard
 	m.online.Store(false)
 
-	// replace channel with nil. any in flight lock requests will fail
-	// in the manager after this swap.
+	// replace channel with nil causing any in-flight lock requests to fail.
 	m.chanMu.Lock()
 	rc := m.reqChan
 	m.reqChan = nil
@@ -174,7 +186,7 @@ func (m *guard) quit() {
 	// safe to close channel now
 	close(rc)
 
-	// drain any in flight lock requests blocking on a response.
+	// drain any requests which made it to the channel before nil swap
 	for req := range rc {
 		var resp response
 		resp.err = fmt.Errorf("managers ctx canceled. construct a new one")
@@ -188,8 +200,10 @@ func (m *guard) quit() {
 		f()
 	}
 
-	// close conn killing db locks
-	m.conn.Close(m.root)
+	// if conn is present close it. releases all locks
+	if m.conn != nil {
+		m.conn.Close(m.root)
+	}
 	// for good measure, this will already be canceled since its derived
 	// from the ctx that got us here.
 	m.cancel()
@@ -201,6 +215,7 @@ func (m *guard) quit() {
 // handleRequest is guarenteed to have exclusive access to m.conn and m.m
 func (m *guard) handleRequest(req request, ctx context.Context) {
 	var resp response
+
 	if !m.online.Load().(bool) {
 		resp.err = ErrDatabaseUnavailable
 		resp.ok = false
