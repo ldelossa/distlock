@@ -3,25 +3,16 @@ package distlock
 import (
 	"context"
 	"log"
+	"math/rand"
 	"os/exec"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v4"
+	"golang.org/x/sync/errgroup"
 )
-
-// pg_advisory session locks are nestable over the same conn.
-// this means if you issue a lock for a specific key over the same conn
-// the lock *will* be granted.
-//
-// this is not the behavior we want. instead the mananger will check if a session
-// lock exists in it's own business logic, and reject the lock request if so.
-// this functionality is checked in Test_SingleSessionMutualExclusion
-//
-// two distinct processes will generate two distinct connections. making a lock
-// request across two distinct connections *will* work the way we expect.
-// this functionality is checked in Test_MultiSessionMutualExclusion
 
 const (
 	dsn = "host=localhost port=5434 user=distlock dbname=distlock sslmode=disable"
@@ -74,266 +65,140 @@ func waitDB(t *testing.T) {
 	log.Printf("db up")
 }
 
+func pgLocksCount(t *testing.T) int {
+	tctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	conn, err := pgx.Connect(tctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+
+	const (
+		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
+	)
+
+	var i int
+	row := conn.QueryRow(context.Background(), query)
+	err = row.Scan(&i)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return i
+}
+
 func Test_Manager(t *testing.T) {
 	startDB(t)
 	waitDB(t)
 
-	// concurrency bugs are intermittent. lets run
-	// these tests a bunch of times.
+	// all tests start with database up. all tests should restore
+	// db is they tear it down.
 
-	for i := 0; i < 9; i++ {
-		test_MultiSessionMutualExclusion(t)
+	t.Run("BasicUsage", test_BasicUsage)
+
+	// these use random counts, perform in a loop to maximize test effectiveness.
+	for i := 0; i < 4; i++ {
+		s := strconv.Itoa(i)
+		t.Run("SingleSessionMutualExclusion-Run-"+s, test_SingleSessionMutualExclusion)
+		t.Run("MultiSessionMutualExclusion-Run-"+s, test_MultiSessionMutualExclusion)
+		t.Run("TryLockSingleSession-Run-"+s, test_TryLockSingleSession)
+		t.Run("TryLockMultiSession-Run-"+s, test_TryLockSingleSession)
 	}
-	for i := 0; i < 9; i++ {
-		test_TryLockSingleSession(t)
-	}
-	for i := 0; i < 9; i++ {
-		test_TryLockMultiSession(t)
-	}
-	for i := 0; i < 9; i++ {
-		test_ProcessDeath(t)
-	}
-	for i := 0; i < 9; i++ {
-		test_DBFlap(t)
-	}
-	// should be last test, it rips down the local db
-	test_DBFailure(t)
+
+	t.Run("CTXCancelWhileReconnecting", test_CTXCancelWhileReconnecting)
+	t.Run("DBFlap", test_DBFlap)
+	t.Run("CTXCancelDBFailure", test_CTXCancelDBFailure)
+
+	stopDB(t)
 }
 
-func test_DBFlap(t *testing.T) {
-	// get a lock
+func test_BasicUsage(t *testing.T) {
+	// create a manager
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 
+	// get a lock
 	key := "test-key"
-	_, err = manager.Lock(key)
+	ctx, err = manager.Lock(key)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	// launch a go routine to return lock
+	// in a bit
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		err := manager.Unlock(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
+	// block on ctx
+	<-ctx.Done()
+
+	// attempt double unlock
+	err = manager.Unlock(key)
+	log.Print(err)
+	if err == nil {
+		t.Fatalf("expected error on double unlock")
+	}
+
+	// lock the same key
+	ctx, err = manager.Lock(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// launch a go routine to cancel the manager's ctx
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		cancel()
+	}()
+	// block on ctx
+	<-ctx.Done()
+
+	if i := pgLocksCount(t); i != 0 {
+		t.Fatalf("%d locks still in locks table: %v", i, err)
+	}
+}
+
+func test_CTXCancelWhileReconnecting(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	manager, err := NewManager(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// tear down db
 	stopDB(t)
 
-	// make sure we get an error trying to get a lock
-	_, err = manager.Lock(key)
-	if err == nil {
-		t.Fatal("expected error")
+	tctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	// spin on guard reconnecting status
+	for !manager.g.reconnecting.Load().(bool) {
+		if tctx.Err() != nil {
+			t.Fatalf("timed out waiting for reconnect loop to begin")
+		}
+	}
+
+	key := "test-key"
+	ctx, err = manager.Lock(key)
+	if err != ErrDatabaseUnavailable {
+		t.Fatalf("got: %v want: %v", err, ErrDatabaseUnavailable)
+	}
+
+	// cancel ctx
+	cancel()
+
+	ctx, err = manager.Lock(key)
+	if err != ErrDatabaseUnavailable {
+		t.Fatalf("got: %v want: %v", err, ErrDatabaseUnavailable)
 	}
 
 	startDB(t)
 	waitDB(t)
-
-	log.Printf("sleeping...")
-	time.Sleep(1 * time.Second)
-	log.Printf("done sleeping...")
-
-	// make sure we dont get an error getting a lock
-	_, err = manager.Lock(key)
-	if err != nil {
-		t.Fatal(err)
-	}
 }
 
-// this is a hack of a test, but you can run this, then ctrl-c on the command line
-// and confirm when the process dies the lock is removed from the database.
-//
-// do not inclue in the automated tests.
-func test_ProcessDeathManual(t *testing.T) {
-	const (
-		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
-	)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager, err := NewManager(ctx, dsn)
-
-	key := "test-key"
-	_, err = manager.Lock(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(1 * time.Hour)
-}
-
-func test_ProcessDeath(t *testing.T) {
-	const (
-		query = `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory';`
-	)
-
-	tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	mctx, mCancel := context.WithCancel(context.Background())
-	manager, err := NewManager(mctx, dsn)
-
-	// take some locks
-	keys := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
-	for _, key := range keys {
-		_, err = manager.Lock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// confirm locks in db
-	tctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	conn1, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-
-	var i int
-
-	row := conn1.QueryRow(context.Background(), query)
-	err = row.Scan(&i)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if i != len(keys) {
-		t.Fatalf("got: %v want: %v", i, len(keys))
-	}
-
-	// cancel manager ctx, should drop all locks
-	mCancel()
-	time.Sleep(100 * time.Millisecond)
-
-	row = conn1.QueryRow(context.Background(), query)
-	err = row.Scan(&i)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if i != 0 {
-		t.Fatalf("got: %v want: %v", i, 0)
-	}
-}
-
-func test_TryLockMultiSession(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager0, err := NewManager(ctx, dsn)
-
-	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
-	manager1, err := NewManager(ctx, dsn)
-
-	key := "test-key0"
-
-	var acquired struct {
-		sync.Mutex
-		b bool
-	}
-	// launch goroutine that will acquire lock and unlock
-	// in some time
-	go func() {
-		_, err := manager0.Lock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		acquired.Lock()
-		acquired.b = true
-		acquired.Unlock()
-		log.Printf("goroutine 0 acquired lock. sleeping for 5 seconds before unlock")
-
-		time.Sleep(5 * time.Second)
-		err = manager0.Unlock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	// lock dance to confirm goroutine 0 acquired dist lock
-	for {
-		acquired.Lock()
-		if acquired.b {
-			break
-		}
-		acquired.Unlock()
-	}
-	acquired.Unlock()
-
-	tctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	ctx, err = manager1.TryLock(tctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-
-	tctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	err = manager1.Unlock(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-
-}
-
-func test_TryLockSingleSession(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager, err := NewManager(ctx, dsn)
-
-	key := "test-key0"
-
-	var acquired struct {
-		sync.Mutex
-		b bool
-	}
-	// launch goroutine that will acquire lock and unlock
-	// in some time
-	go func() {
-		_, err := manager.Lock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		acquired.Lock()
-		acquired.b = true
-		acquired.Unlock()
-		log.Printf("goroutine 0 acquired lock. sleeping for 5 seconds before unlock")
-
-		time.Sleep(5 * time.Second)
-		err = manager.Unlock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	// lock dance to confirm goroutine 0 acquired dist lock
-	for {
-		acquired.Lock()
-		if acquired.b {
-			break
-		}
-		acquired.Unlock()
-	}
-	acquired.Unlock()
-
-	tctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	ctx, err = manager.TryLock(tctx, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-
-	tctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
-	err = manager.Unlock(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-
-}
-
-func test_DBFailure(t *testing.T) {
+func test_CTXCancelDBFailure(t *testing.T) {
 	// create some locks
 	keys := []string{"test-key0", "test-key1", "test-key2", "test-key3"}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -361,154 +226,294 @@ func test_DBFailure(t *testing.T) {
 	// rip database down
 	stopDB(t)
 	wg.Wait()
+
+	// all routines returned from blockg on ctx.
+	startDB(t)
+	waitDB(t)
 }
 
-func test_MultiSessionMutualExclusion(t *testing.T) {
-	tctx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	conn0, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-	if conn0 == nil {
-		t.Fatalf("conn is nil")
-	}
-	conn1, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-	if conn1 == nil {
-		t.Fatalf("conn is nil")
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	manager0, err := NewManager(ctx, dsn)
-	manager1, err := NewManager(ctx, dsn)
-
-	// test mutual exclusion
-	key := "test-key"
-	var wg sync.WaitGroup
-
-	acquire := make([]bool, 2)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := manager0.Lock(key)
-		if err != nil {
-			if err == ErrMutualExclusion {
-				log.Printf("go routine %d lost the race", 0)
-				return
-			}
-			log.Printf("ERR: go routine %d encountered error: %v", 0, err)
-			return
-		}
-		log.Printf("go routine %d acquired lock", 0)
-		acquire[0] = true
-		return
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, err := manager1.Lock(key)
-		if err != nil {
-			if err == ErrMutualExclusion {
-				log.Printf("go routine %d lost the race", 1)
-				return
-			}
-			log.Printf("ERR: go routine %d encountered error: %v", 1, err)
-			return
-		}
-		log.Printf("go routine %d acquired lock", 1)
-		acquire[1] = true
-		return
-	}()
-	wg.Wait()
-
-	count := 0
-	if acquire[0] {
-		count++
-		// go routine 0 informed us it acquired the lock.
-		// attempt unlock and check error
-		err = manager0.Unlock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// a subsequent call to unlock should fail.
-		err = manager0.Unlock(key)
-		if err == nil {
-			t.Fatal(err)
-		}
-	}
-	if acquire[1] {
-		count++
-		// go routine 1 informed us it acquired the lock.
-		// attempt unlock and check error
-		err = manager1.Unlock(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// a subsequent call to unlock should fail.
-		err = manager1.Unlock(key)
-		if err == nil {
-			t.Fatal(err)
-		}
-	}
-
-	if count == 2 {
-		t.Fatal("both go routines reported acquiring the lock")
-	}
-}
-
-func test_SingleSessionMutualExclusion(t *testing.T) {
-	tctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	conf, err := pgx.ParseConfig(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	conn, err := pgx.ConnectConfig(tctx, conf)
-	if err != nil {
-		t.Fatalf("failed to connect to postgres: %v", err)
-	}
-	if conn == nil {
-		t.Fatalf("conn is nil")
-	}
-
+func test_DBFlap(t *testing.T) {
+	// get a lock
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	manager, err := NewManager(ctx, dsn)
 
-	// test mutual exclusion
 	key := "test-key"
-	var wg sync.WaitGroup
-	for i := 0; i < 4; i++ {
-		ii := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_, err := manager.Lock(key)
-			if err != nil {
-				if err == ErrMutualExclusion {
-					log.Printf("go routine %d lost the race", ii)
-					return
-				}
-				log.Printf("ERR: go routine %d encountered error: %v", ii, err)
-				return
-			}
-			log.Printf("go routine %d acquired lock", ii)
-			return
-		}()
-	}
-	wg.Wait()
-	err = manager.Unlock(key)
+	_, err = manager.Lock(key)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	stopDB(t)
+
+	// make sure we get an error trying to get a lock
+	_, err = manager.Lock(key)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	startDB(t)
+	waitDB(t)
+
+	time.Sleep(1 * time.Second)
+
+	// make sure we dont get an error getting a lock
+	_, err = manager.Lock(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func test_TryLockMultiSession(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// key that will be used
+	key := "test-key"
+
+	// random goroutine count
+	routines := rand.Intn(100)
+	if routines <= 1 {
+		routines = 2
+	}
+	t.Logf("testing with %d goroutines", routines)
+
+	// keep track of which go routines acquire a lock
+	acquired := make([]bool, routines)
+
+	// create a manager for each routine
+	managers := make([]*Manager, routines)
+	for i := 0; i < routines; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		mgr, err := NewManager(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		managers[i] = mgr
+	}
+
+	tctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	var errGrp errgroup.Group
+	for i := 0; i < routines; i++ {
+		ii := i
+		errGrp.Go(func() error {
+			randomSleep := rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+
+			_, err := managers[ii].TryLock(tctx, key)
+			if err != nil {
+				return err
+			}
+			acquired[ii] = true
+
+			randomSleep = rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+			err = managers[ii].Unlock(key)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+	}
+	if err := errGrp.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	acquireCount := 0
+	for i, b := range acquired {
+		if b {
+			acquireCount++
+			t.Logf("goroutine %d acquired lock", i)
+		}
+	}
+	if acquireCount != routines {
+		t.Fatalf("got: %d want: %d", acquireCount, routines)
+	}
+
+}
+
+func test_TryLockSingleSession(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// key that will be used
+	key := "test-key"
+
+	// random goroutine count
+	routines := rand.Intn(100)
+	if routines <= 1 {
+		routines = 2
+	}
+	t.Logf("testing with %d goroutines", routines)
+
+	// keep track of which go routines acquire a lock
+	acquired := make([]bool, routines)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, err := NewManager(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var errGrp errgroup.Group
+	for i := 0; i < routines; i++ {
+		ii := i
+		errGrp.Go(func() error {
+			randomSleep := rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+
+			_, err := mgr.TryLock(ctx, key)
+			if err != nil {
+				return err
+			}
+			acquired[ii] = true
+
+			randomSleep = rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+			err = mgr.Unlock(key)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		})
+	}
+	if err = errGrp.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	acquireCount := 0
+	for i, b := range acquired {
+		if b {
+			acquireCount++
+			t.Logf("goroutine %d acquired lock", i)
+		}
+	}
+	if acquireCount != routines {
+		t.Fatalf("got: %d want: %d", acquireCount, routines)
+	}
+
+}
+
+func test_MultiSessionMutualExclusion(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// key that will be used
+	key := "test-key"
+
+	// random goroutine count
+	routines := rand.Intn(50)
+	if routines <= 1 {
+		routines = 2
+	}
+	t.Logf("testing with %d goroutines", routines)
+
+	// keep track of which go routines acquire a lock
+	acquired := make([]bool, routines)
+
+	// create a manager for each routine
+	managers := make([]*Manager, routines)
+	for i := 0; i < routines; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		mgr, err := NewManager(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		managers[i] = mgr
+	}
+
+	var errGrp errgroup.Group
+	for i := 0; i < routines; i++ {
+		ii := i
+		errGrp.Go(func() error {
+
+			randomSleep := rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+
+			_, err := managers[ii].Lock(key)
+			if err != nil {
+				if err == ErrMutualExclusion {
+					return nil
+				}
+				return err
+			}
+			acquired[ii] = true
+			return nil
+		})
+	}
+	if err := errGrp.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	acquireCount := 0
+	for i, b := range acquired {
+		if b {
+			acquireCount++
+			t.Logf("goroutine %d acquired lock", i)
+		}
+	}
+	if acquireCount != 1 {
+		t.Fatalf("got: %d want: %d", acquireCount, 1)
+	}
+}
+
+func test_SingleSessionMutualExclusion(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+
+	// key that will be used
+	key := "test-key"
+
+	// random goroutine count
+	routines := rand.Intn(1000)
+	if routines <= 1 {
+		routines = 2
+	}
+	t.Logf("testing with %d goroutines", routines)
+
+	// keep track of which go routines acquire a lock
+	acquired := make([]bool, routines)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr, err := NewManager(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var errGrp errgroup.Group
+	for i := 0; i < routines; i++ {
+		ii := i
+		errGrp.Go(func() error {
+			randomSleep := rand.Intn(500)
+			time.Sleep(time.Duration(randomSleep) * time.Millisecond)
+
+			_, err := mgr.Lock(key)
+			if err != nil {
+				if err == ErrMutualExclusion {
+					return nil
+				}
+				return err
+			}
+			acquired[ii] = true
+			return nil
+		})
+	}
+	if err = errGrp.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	acquireCount := 0
+	for i, b := range acquired {
+		if b {
+			acquireCount++
+			t.Logf("goroutine %d acquired lock", i)
+		}
+	}
+	if acquireCount != 1 {
+		t.Fatalf("got: %d want: %d", acquireCount, 1)
 	}
 }

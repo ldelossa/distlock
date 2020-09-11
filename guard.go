@@ -26,8 +26,6 @@ var ErrMutualExclusion = fmt.Errorf("another process is holding the requested lo
 // requests can simply ignore this, their locks are gone.
 var ErrDatabaseUnavailable = fmt.Errorf("database currently unavailable.")
 
-var ErrCtxCanceled = fmt.Errorf("manager's ctx canceled. construct a new one.")
-
 func keyify(key string) int64 {
 	h := fnv.New64a()
 	io.WriteString(h, key)
@@ -126,12 +124,10 @@ func (m *guard) reconnect(ctx context.Context) {
 				return
 			}
 
-			// if ctx canceled, this will fail, if not it'll create a natural
 			tctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 			conn, err := pgx.Connect(tctx, m.dsn)
 			cancel()
 			if err != nil {
-				log.Printf("database still unavailable...")
 				continue
 			}
 
