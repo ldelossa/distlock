@@ -5,6 +5,6 @@ Dist lock implements a distributed lock via postgres.
 
 * No Transcations.
 * A single manager uses a single DB conn.
-* Cleanup databse locks on process death.
-* Cleanup application locks on database death.
-* A ctx based api where ctx is canceled when lock is lost
+* Cleanup database locks on process death.
+* Cleanup application bookkeeping on database disconnection.
+* A ctx based api where ctx is canceled when lock is lost.
