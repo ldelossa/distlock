@@ -91,13 +91,13 @@ func Test_Manager(t *testing.T) {
 	waitDB(t)
 
 	// all tests start with database up. all tests should restore
-	// db is they tear it down.
-
-	t.Run("BasicUsage", test_BasicUsage)
+	// db if they tear it down.
 
 	// these use random counts, perform in a loop to maximize test effectiveness.
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 5; i++ {
 		s := strconv.Itoa(i)
+		t.Run("BasicUsage-Run-"+s, test_BasicUsage)
+		t.Run("Counter-Run-"+s, test_Counter)
 		t.Run("SingleSessionMutualExclusion-Run-"+s, test_SingleSessionMutualExclusion)
 		t.Run("MultiSessionMutualExclusion-Run-"+s, test_MultiSessionMutualExclusion)
 		t.Run("TryLockSingleSession-Run-"+s, test_TryLockSingleSession)
@@ -109,6 +109,33 @@ func Test_Manager(t *testing.T) {
 	t.Run("CTXCancelDBFailure", test_CTXCancelDBFailure)
 
 	stopDB(t)
+}
+
+func test_Counter(t *testing.T) {
+	// create a manager with a random limit
+	max := uint64(rand.Intn(1000))
+	ctx, cancel := context.WithCancel(context.Background())
+	manager, err := NewManager(ctx, dsn, WithMax(max))
+
+	var i int
+	for i = 0; i < int(max); i++ {
+		key := "test-key-" + strconv.Itoa(i)
+		_, err := manager.Lock(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	i++
+	key := "test-key-" + strconv.Itoa(i)
+	_, err = manager.Lock(key)
+	if err != ErrMaxLocks {
+		t.Fatalf("got: %v want: %v", err, ErrMaxLocks)
+	}
+	cancel()
+	// canceling ctx still takes some time to clear locks in the db,
+	// sleep for a bit to make sure locks are removed.
+	time.Sleep(50 * time.Millisecond)
 }
 
 func test_BasicUsage(t *testing.T) {

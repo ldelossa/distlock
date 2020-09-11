@@ -26,6 +26,10 @@ var ErrMutualExclusion = fmt.Errorf("another process is holding the requested lo
 // requests can simply ignore this, their locks are gone.
 var ErrDatabaseUnavailable = fmt.Errorf("database currently unavailable.")
 
+// ErrMaxLocks informs caller maximum number of locks have been
+// taken.
+var ErrMaxLocks = fmt.Errorf("maximum number of locks acquired")
+
 func keyify(key string) int64 {
 	h := fnv.New64a()
 	io.WriteString(h, key)
@@ -60,17 +64,17 @@ type response struct {
 //
 // guard should only be created via a Manager's constructor.
 type guard struct {
-	root    context.Context
-	cancel  context.CancelFunc
-	chanMu  sync.Mutex
-	reqChan chan request
-	dsn     string
-	m       map[string]context.CancelFunc
-	conn    *pgx.Conn
-	// atomic bool. true if the guard is not connected to the db.
-	online atomic.Value
-	// atomic bool. true if reconnection loop is running
+	max          uint64
+	root         context.Context
+	cancel       context.CancelFunc
+	chanMu       sync.Mutex
+	reqChan      chan request
+	dsn          string
+	m            map[string]context.CancelFunc
+	conn         *pgx.Conn
+	online       atomic.Value
 	reconnecting atomic.Value
+	counter      uint64
 }
 
 // ioLoop is a serialized event loop.
@@ -101,7 +105,7 @@ func (m *guard) ioLoop(ctx context.Context) {
 
 // reconnect occurs when the database connection is lost.
 //
-// reconnect is guarenteed to have exclusive access to m.conn and m.m
+// reconnect is guarenteed to have exclusive access to m.conn, m.counter and m.m
 //
 // the ioLoop will continue processing requests, returning errors, while
 // the database is not available.
@@ -110,6 +114,7 @@ func (m *guard) reconnect(ctx context.Context) {
 
 	m.online.Store(false)
 	m.reconnecting.Store(true)
+	m.counter = 0
 
 	for key, f := range m.m {
 		log.Printf("database disconnected. canceling lock for %s", key)
@@ -208,7 +213,7 @@ func (m *guard) quit() {
 // handleRequest multiplexes guard requests to the appropriate postgres
 // methods.
 //
-// handleRequest is guarenteed to have exclusive access to m.conn and m.m
+// handleRequest is guarenteed to have exclusive access to m.conn, m.counter and m.m
 func (m *guard) handleRequest(req request, ctx context.Context) {
 	var resp response
 
@@ -236,6 +241,10 @@ func (m *guard) lock(ctx context.Context, key string) response {
 		return response{false, nil, ErrMutualExclusion}
 	}
 
+	if m.counter >= m.max {
+		return response{false, nil, ErrMaxLocks}
+	}
+
 	var ok bool
 
 	row := m.conn.QueryRow(ctx, trySessionLock, keyify(key))
@@ -252,6 +261,7 @@ func (m *guard) lock(ctx context.Context, key string) response {
 	ctx, cancel := context.WithCancel(m.root)
 
 	m.m[key] = cancel
+	m.counter++
 	return response{true, ctx, nil}
 }
 
@@ -274,5 +284,6 @@ func (m *guard) unlock(ctx context.Context, key string) response {
 
 	f()
 	delete(m.m, key)
+	m.counter--
 	return response{true, nil, nil}
 }

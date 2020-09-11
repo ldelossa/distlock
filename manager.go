@@ -3,6 +3,7 @@ package distlock
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v4"
@@ -18,7 +19,15 @@ type Manager struct {
 	g *guard
 }
 
-func NewManager(ctx context.Context, dsn string) (*Manager, error) {
+type Opt func(*Manager)
+
+func WithMax(max uint64) Opt {
+	return func(m *Manager) {
+		m.g.max = max
+	}
+}
+
+func NewManager(ctx context.Context, dsn string, opts ...Opt) (*Manager, error) {
 	reqChan := make(chan request, 1024)
 	m := make(map[string]context.CancelFunc)
 
@@ -42,13 +51,23 @@ func NewManager(ctx context.Context, dsn string) (*Manager, error) {
 		m:       m,
 		conn:    conn,
 	}
+	mgr := &Manager{
+		g: g,
+	}
+
+	for _, f := range opts {
+		f(mgr)
+	}
+
+	if mgr.g.max == 0 {
+		mgr.g.max = math.MaxUint64
+	}
+
 	g.online.Store(true)
 	g.reconnecting.Store(false)
 	go g.ioLoop(g.root)
 
-	return &Manager{
-		g: g,
-	}, nil
+	return mgr, nil
 }
 
 func (m *Manager) Lock(key string) (context.Context, error) {
