@@ -15,4 +15,4 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v2
       - name: Tests
-        run: go test -v ./...
+        run: apt-get update -y && apt-get install -y docker docker-compose
