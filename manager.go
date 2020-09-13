@@ -2,7 +2,7 @@ package distlock
 
 import (
 	"context"
-	"fmt"
+	"log"
 	"math"
 	"time"
 
@@ -29,7 +29,7 @@ func WithMax(max uint64) Opt {
 
 func NewManager(ctx context.Context, dsn string, opts ...Opt) (*Manager, error) {
 	reqChan := make(chan request, 1024)
-	m := make(map[string]context.CancelFunc)
+	locks := make(map[string]*lctx)
 
 	conf, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -41,14 +41,10 @@ func NewManager(ctx context.Context, dsn string, opts ...Opt) (*Manager, error) 
 		return nil, err
 	}
 
-	root, cancel := context.WithCancel(ctx)
-
 	g := &guard{
-		root:    root,
-		cancel:  cancel,
 		reqChan: reqChan,
 		dsn:     dsn,
-		m:       m,
+		locks:   locks,
 		conn:    conn,
 	}
 	mgr := &Manager{
@@ -65,57 +61,68 @@ func NewManager(ctx context.Context, dsn string, opts ...Opt) (*Manager, error) 
 
 	g.online.Store(true)
 	g.reconnecting.Store(false)
-	go g.ioLoop(g.root)
+	go g.ioLoop(ctx)
 
 	return mgr, nil
 }
 
-func (m *Manager) Lock(key string) (context.Context, error) {
-	c := make(chan response)
+func (m *Manager) Lock(ctx context.Context, key string) (context.Context, context.CancelFunc) {
+	// parent context already done
+	if err := ctx.Err(); err != nil {
+		return &lctx{done: closedchan, err: ErrContextCanceled}, func() {}
+	}
+
+	// manager is not connected to database
+	if !m.g.online.Load().(bool) {
+		return &lctx{done: closedchan, err: ErrDatabaseUnavailable}, func() {}
+	}
+
 	req := request{
 		t:        Lock,
 		key:      key,
-		respChan: c,
+		respChan: make(chan response),
 	}
 
-	if !m.g.online.Load().(bool) {
-		return nil, ErrDatabaseUnavailable
-	}
-
+	// guaranteed to return
 	resp := m.g.request(req)
 
 	if !resp.ok {
-		return nil, resp.err
+		return resp.ctx, func() {}
 	}
-	return resp.ctx, nil
+
+	m.propagateCancel(ctx, resp.ctx, key)
+
+	return resp.ctx, func() {
+		m.unlock(key)
+	}
 }
 
-func (m *Manager) Unlock(key string) error {
-	c := make(chan response)
-	req := request{
-		t:        Unlock,
-		key:      key,
-		respChan: c,
+func (m *Manager) propagateCancel(parent context.Context, child context.Context, key string) {
+	// parent already done.
+	if err := parent.Err(); err != nil {
+		m.unlock(key)
+		return
 	}
 
-	if !m.g.online.Load().(bool) {
-		return ErrDatabaseUnavailable
-	}
-
-	resp := m.g.request(req)
-
-	if !resp.ok {
-		return resp.err
-	}
-	return nil
+	// kick off listener. will exit when parent is canceled or child's cancel func is called.
+	go func() {
+		select {
+		case <-parent.Done():
+			m.unlock(key)
+		case <-child.Done():
+		}
+	}()
 }
 
-// TryLock will block on acquiring a lock until either success or the provided ctx
-// is canceled.
-func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, error) {
+// TryLock will block on acquiring a lock until either success or the provided ctx is canceled.
+func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, context.CancelFunc) {
 	for {
 		if ctx.Err() != nil {
-			return nil, fmt.Errorf("provided ctx has been canceled")
+			return &lctx{done: closedchan, err: ctx.Err()}, func() {}
+		}
+
+		if !m.g.online.Load().(bool) {
+			return &lctx{done: closedchan, err: ErrDatabaseUnavailable}, func() {}
 		}
 
 		c := make(chan response)
@@ -125,21 +132,39 @@ func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, err
 			respChan: c,
 		}
 
-		if !m.g.online.Load().(bool) {
-			return nil, ErrDatabaseUnavailable
-		}
-
 		resp := m.g.request(req)
 		// lock acquired
 		if resp.ok {
-			return resp.ctx, nil
+			m.propagateCancel(ctx, resp.ctx, key)
+			return resp.ctx, func() { m.unlock(key) }
 		}
 
-		// if ErrMutualExclusion just retry
+		// if ErrMutualExclusion retry...
 		if resp.err == ErrMutualExclusion {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		return nil, resp.err
+
+		// received a non mutual exclusion error
+		return resp.ctx, func() {}
+	}
+}
+
+// unlock will issue a request to the guard to unlock a given key.
+func (m *Manager) unlock(key string) {
+	if !m.g.online.Load().(bool) {
+		return
+	}
+
+	req := request{
+		t:        Unlock,
+		key:      key,
+		respChan: make(chan response),
+	}
+
+	resp := m.g.request(req)
+
+	if !resp.ok {
+		log.Printf("unlock err: %v", resp.err)
 	}
 }
