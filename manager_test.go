@@ -18,7 +18,7 @@ const (
 	dsn = "host=localhost port=5434 user=distlock dbname=distlock sslmode=disable"
 )
 
-func stopDB(t *testing.T) {
+func stopDB(t testing.TB) {
 	// a command to rip down postgres unexpectedly
 	cmd := exec.Command(
 		"docker-compose",
@@ -31,7 +31,7 @@ func stopDB(t *testing.T) {
 	log.Printf("db down")
 }
 
-func startDB(t *testing.T) {
+func startDB(t testing.TB) {
 	// a command to start local postgres instance
 	cmd := exec.Command(
 		"docker-compose",
@@ -45,7 +45,7 @@ func startDB(t *testing.T) {
 	log.Printf("db started")
 }
 
-func waitDB(t *testing.T) {
+func waitDB(t testing.TB) {
 	up := false
 	conf, err := pgx.ParseConfig(dsn)
 	if err != nil {
