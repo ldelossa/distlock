@@ -10,9 +10,12 @@ jobs:
     container: docker.io/library/golang:${{ matrix.go }}-buster
     strategy:
       matrix:
-        go: ['1.13', '1.14']
+        go: ['1.15', '1.16']
     steps:
       - name: Checkout
         uses: actions/checkout@v2
+      - name: Dependencies
+        run: apt-get update -y && apt-get install -y docker docker-compose
       - name: Tests
-        run: go test -v ./...
+        run: go test -race -timeout 0 .
+

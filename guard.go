@@ -5,35 +5,41 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v4"
+	"github.com/quay/zlog"
+	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/label"
 )
 
 const (
-	trySessionLock   = `SELECT pg_try_advisory_lock($1);`
-	trySessionUnlock = `SELECT pg_advisory_unlock($1)`
+	trySessionLock   = `SELECT lock FROM pg_try_advisory_lock($1) lock WHERE lock = true;`
+	trySessionUnlock = `SELECT lock FROM pg_advisory_unlock($1) lock WHERE lock = true;`
 )
 
-// Signifies mutual exclusion could not be obtained. In other words another
-// process owns a requested lock.
+// Signifies mutual exclusion could not be obtained.
+// In other words another process owns a requested lock.
 var ErrMutualExclusion = fmt.Errorf("another process is holding the requested lock")
 
-// Signifies the dabatase is unavialable. Locks cannot be provided. Unlock
-// requests can simply ignore this, their locks are gone.
+// Signifies the database is unavialable. Locks cannot be provided.
 var ErrDatabaseUnavailable = fmt.Errorf("database currently unavailable.")
+
+// ErrContextCanceled indicates the parent's context was canceled or
+// the lock's cancelFunc was invoked.
+var ErrContextCanceled = fmt.Errorf("ErrContextCanceled")
 
 // ErrMaxLocks informs caller maximum number of locks have been
 // taken.
 var ErrMaxLocks = fmt.Errorf("maximum number of locks acquired")
 
-func keyify(key string) int64 {
+func keyify(key string) []byte {
 	h := fnv.New64a()
 	io.WriteString(h, key)
-	return int64(h.Sum64())
+	b := []byte{}
+	return h.Sum(b)
 }
 
 type RequestType int
@@ -54,9 +60,9 @@ type request struct {
 // response is an internal response for a
 // lock request
 type response struct {
+	// will be true if lock is acquired
 	ok  bool
 	ctx context.Context
-	err error
 }
 
 // guard provides a concurrency and deadlock safe api for requesting
@@ -65,24 +71,23 @@ type response struct {
 // guard should only be created via a Manager's constructor.
 type guard struct {
 	max          uint64
-	root         context.Context
-	cancel       context.CancelFunc
+	counter      uint64
 	chanMu       sync.Mutex
 	reqChan      chan request
 	dsn          string
-	m            map[string]context.CancelFunc
+	locks        map[string]*lctx
 	conn         *pgx.Conn
 	online       atomic.Value
 	reconnecting atomic.Value
-	counter      uint64
 }
 
-// ioLoop is a serialized event loop.
-// the loop provides mutually exclusive access to m.conn and m.m
-//
-// in the event a reconnect loop is running in the background this
-// loop is guarenteed not to access m.conn and m.m.
+// ioLoop is a serialized event loop ensuring synchronization of
+// internal data structure access.
 func (m *guard) ioLoop(ctx context.Context) {
+	ctx = baggage.ContextWithValues(ctx,
+		label.String("component", "distlock/guard.ioLoop"),
+	)
+	zlog.Info(ctx).Msg("lock manager online.")
 	t := time.NewTicker(30 * time.Millisecond)
 	defer t.Stop()
 	for {
@@ -91,13 +96,14 @@ func (m *guard) ioLoop(ctx context.Context) {
 			// only ping if we are online.
 			if m.online.Load().(bool) {
 				if err := m.conn.Ping(ctx); err != nil {
+					zlog.Info(ctx).Msg("detected database disconnection. entry reconnect loop.")
 					m.reconnect(ctx)
 				}
 			}
 		case req := <-m.reqChan:
-			m.handleRequest(req, ctx)
+			m.handleRequest(ctx, req)
 		case <-ctx.Done():
-			m.quit()
+			m.quit(ctx)
 			return
 		}
 	}
@@ -105,31 +111,33 @@ func (m *guard) ioLoop(ctx context.Context) {
 
 // reconnect occurs when the database connection is lost.
 //
-// reconnect is guarenteed to have exclusive access to m.conn, m.counter and m.m
-//
-// the ioLoop will continue processing requests, returning errors, while
-// the database is not available.
+// gaurenteed to have exclusive access to internal data structures.
 func (m *guard) reconnect(ctx context.Context) {
-	log.Printf("manager detected database disconnect... entering reconnection loop")
-
+	ctx = baggage.ContextWithValues(ctx,
+		label.String("component", "distlock/guard.reconnect"),
+	)
 	m.online.Store(false)
 	m.reconnecting.Store(true)
 	m.counter = 0
 
-	for key, f := range m.m {
-		log.Printf("database disconnected. canceling lock for %s", key)
-		f()
+	for key, lock := range m.locks {
+		lock.cancel(ErrDatabaseUnavailable)
+		delete(m.locks, key)
 	}
 
+	// this is launched in a go-routine to
+	// so ioLoop unblocks.
 	go func(ctx context.Context) {
 		defer m.reconnecting.Store(false)
 		for {
 			if ctx.Err() != nil {
-				log.Printf("ctx canceled during reconnect loop.")
 				return
 			}
 
-			tctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+			zlog.Info(ctx).Str("timeout", (500*time.Millisecond).String()).
+				Str("dsn", m.dsn).
+				Msg("attempting database reconnect with timeout")
+			tctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			conn, err := pgx.Connect(tctx, m.dsn)
 			cancel()
 			if err != nil {
@@ -140,11 +148,11 @@ func (m *guard) reconnect(ctx context.Context) {
 			m.conn = conn
 
 			// re-initialize map
-			m.m = make(map[string]context.CancelFunc)
+			m.locks = make(map[string]*lctx)
 
 			// set status back to online
 			m.online.Store(true)
-			log.Printf("database connection restored...")
+			zlog.Info(ctx).Str("dsn", m.dsn).Msg("database connection restored")
 			return
 		}
 	}(ctx)
@@ -158,18 +166,24 @@ func (m *guard) request(r request) response {
 	defer m.chanMu.Unlock()
 	select {
 	case m.reqChan <- r:
-		// if a request is pushed, a response is guarenteed
+		// if a request is pushed, a response is guaranteed
 		resp := <-r.respChan
 		return resp
 	default:
 		// this will only happen if guard is shutting down
 		// and reqChan is nil
-		return response{ok: false, err: fmt.Errorf("managers ctx has been canceled")}
+		return response{ok: false, ctx: &lctx{done: closedchan, err: ErrContextCanceled}}
 	}
 }
 
 // quit ensures graceful termination of the guard.
-func (m *guard) quit() {
+//
+// guaranteed to have exclusive access to internal data structures.
+func (m *guard) quit(ctx context.Context) {
+	ctx = baggage.ContextWithValues(ctx,
+		label.String("component", "distlock/guard.quit"),
+	)
+	zlog.Info(ctx).Msg("graceful quit of lock manager started.")
 	for m.reconnecting.Load().(bool) {
 		// waiting for reconnect loop to quit.
 		// should be a short spin
@@ -190,45 +204,49 @@ func (m *guard) quit() {
 	// drain any requests which made it to the channel before nil swap
 	for req := range rc {
 		var resp response
-		resp.err = fmt.Errorf("managers ctx canceled. construct a new one")
+		resp.ctx = &lctx{
+			done: closedchan,
+			err:  ErrContextCanceled,
+		}
 		resp.ok = false
 		req.respChan <- resp
 	}
 
-	// cancel all lock holder's ctx(s)
-	for key, f := range m.m {
-		log.Printf("database disconnected. canceling lock for %s", key)
-		f()
+	// cancel all locks
+	for key, lock := range m.locks {
+		lock.cancel(ErrContextCanceled)
+		delete(m.locks, key)
 	}
 
 	// if conn is present close it. releases all locks
 	if m.conn != nil {
-		m.conn.Close(m.root)
+		m.conn.Close(context.Background())
 	}
-	// for good measure, this will already be canceled since its derived
-	// from the ctx that got us here.
-	m.cancel()
+	zlog.Info(ctx).Msg("graceful quit of lock manager succeeded.")
 }
 
 // handleRequest multiplexes guard requests to the appropriate postgres
 // methods.
 //
-// handleRequest is guarenteed to have exclusive access to m.conn, m.counter and m.m
-func (m *guard) handleRequest(req request, ctx context.Context) {
+// guaranteed to have exclusive access to internal data structures.
+func (m *guard) handleRequest(ctx context.Context, req request) {
 	var resp response
 
 	if !m.online.Load().(bool) {
-		resp.err = ErrDatabaseUnavailable
+		resp.ctx = &lctx{
+			done: closedchan,
+			err:  ErrDatabaseUnavailable,
+		}
 		resp.ok = false
 		req.respChan <- resp
 	}
 
 	switch req.t {
 	case Lock:
-		resp := m.lock(m.root, req.key)
+		resp := m.lock(ctx, req.key)
 		req.respChan <- resp
 	case Unlock:
-		resp := m.unlock(m.root, req.key)
+		resp := m.unlock(ctx, req.key)
 		req.respChan <- resp
 	default:
 	}
@@ -237,53 +255,71 @@ func (m *guard) handleRequest(req request, ctx context.Context) {
 }
 
 func (m *guard) lock(ctx context.Context, key string) response {
-	if _, ok := m.m[key]; ok {
-		return response{false, nil, ErrMutualExclusion}
+	if _, ok := m.locks[key]; ok {
+		return response{false, &lctx{done: closedchan, err: ErrMutualExclusion}}
 	}
 
 	if m.counter >= m.max {
-		return response{false, nil, ErrMaxLocks}
+		return response{false, &lctx{done: closedchan, err: ErrMaxLocks}}
 	}
 
-	var ok bool
-
-	row := m.conn.QueryRow(ctx, trySessionLock, keyify(key))
-
-	err := row.Scan(&ok)
+	// this looks odd, but allows us to
+	// avoid a large amount of allocs.
+	// see: https://www.ldelossa.is/blog/posts/allocation_optimization_in_go.post
+	rr := m.conn.PgConn().ExecParams(ctx,
+		trySessionLock,
+		[][]byte{
+			keyify(key),
+		},
+		nil,
+		[]int16{1},
+		nil)
+	tag, err := rr.Close()
 	if err != nil {
-		return response{false, nil, err}
+		return response{false, &lctx{done: closedchan, err: err}}
 	}
-	if !ok {
-		return response{false, nil, ErrMutualExclusion}
+	if tag.RowsAffected() == 0 {
+		return response{false, &lctx{done: closedchan, err: ErrMutualExclusion}}
 	}
 
-	// dervice ctx from root
-	ctx, cancel := context.WithCancel(m.root)
+	lock := &lctx{
+		err:  nil,
+		done: make(chan struct{}),
+	}
 
-	m.m[key] = cancel
+	m.locks[key] = lock
 	m.counter++
-	return response{true, ctx, nil}
+	return response{true, lock}
 }
 
 func (m *guard) unlock(ctx context.Context, key string) response {
-	var f context.CancelFunc
+	var lock *lctx
 	var ok bool
-	if f, ok = m.m[key]; !ok {
-		return response{false, nil, fmt.Errorf("no existing lock for key %s found", key)}
+	if lock, ok = m.locks[key]; !ok {
+		return response{false, &lctx{done: closedchan, err: fmt.Errorf("no lock for key %s", key)}}
 	}
 
-	row := m.conn.QueryRow(ctx, trySessionUnlock, keyify(key))
+	// lock cancelation and counter decrement
+	defer func() {
+		lock.cancel(ErrContextCanceled)
+		delete(m.locks, key)
+		m.counter--
+	}()
 
-	err := row.Scan(&ok)
+	rr := m.conn.PgConn().ExecParams(ctx,
+		trySessionUnlock,
+		[][]byte{
+			keyify(key),
+		},
+		nil,
+		[]int16{1},
+		nil)
+	tag, err := rr.Close()
 	if err != nil {
-		return response{false, nil, err}
+		return response{false, &lctx{done: closedchan, err: err}}
 	}
-	if !ok {
-		return response{false, nil, fmt.Errorf("unlock of key %s returned false", key)}
+	if tag.RowsAffected() == 0 {
+		return response{false, &lctx{done: closedchan, err: fmt.Errorf("unlock of key %s returned false", key)}}
 	}
-
-	f()
-	delete(m.m, key)
-	m.counter--
-	return response{true, nil, nil}
+	return response{true, nil}
 }
