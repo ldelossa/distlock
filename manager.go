@@ -14,6 +14,7 @@ import (
 //
 // Manager must not be copied after construction.
 type Manager struct {
+	pool *reqPool
 	// Guard provides a concurrency safe request/response api with
 	// guarentees against deadlocks and races.
 	g *guard
@@ -48,7 +49,8 @@ func NewManager(ctx context.Context, dsn string, opts ...Opt) (*Manager, error) 
 		conn:    conn,
 	}
 	mgr := &Manager{
-		g: g,
+		g:    g,
+		pool: NewReqPool(50),
 	}
 
 	for _, f := range opts {
@@ -77,14 +79,11 @@ func (m *Manager) Lock(ctx context.Context, key string) (context.Context, contex
 		return &lctx{done: closedchan, err: ErrDatabaseUnavailable}, func() {}
 	}
 
-	req := request{
-		t:        Lock,
-		key:      key,
-		respChan: make(chan response),
-	}
+	req := m.pool.Get()
+	req.t, req.key = Lock, key
 
-	// guaranteed to return
 	resp := m.g.request(req)
+	m.pool.Put(req)
 
 	if !resp.ok {
 		return resp.ctx, func() {}
@@ -125,14 +124,12 @@ func (m *Manager) TryLock(ctx context.Context, key string) (context.Context, con
 			return &lctx{done: closedchan, err: ErrDatabaseUnavailable}, func() {}
 		}
 
-		c := make(chan response)
-		req := request{
-			t:        Lock,
-			key:      key,
-			respChan: c,
-		}
+		req := m.pool.Get()
+		req.t, req.key = Lock, key
 
 		resp := m.g.request(req)
+		m.pool.Put(req)
+
 		// lock acquired
 		if resp.ok {
 			m.propagateCancel(ctx, resp.ctx, key)
@@ -156,13 +153,11 @@ func (m *Manager) unlock(key string) {
 		return
 	}
 
-	req := request{
-		t:        Unlock,
-		key:      key,
-		respChan: make(chan response),
-	}
+	req := m.pool.Get()
+	req.t, req.key = Unlock, key
 
 	resp := m.g.request(req)
+	m.pool.Put(req)
 
 	if !resp.ok {
 		log.Printf("unlock err: %v", resp.err)
