@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	trySessionLock   = `SELECT pg_try_advisory_lock($1);`
-	trySessionUnlock = `SELECT pg_advisory_unlock($1)`
+	trySessionLock   = `SELECT lock FROM pg_try_advisory_lock($1) lock WHERE lock = true;`
+	trySessionUnlock = `SELECT lock FROM pg_advisory_unlock($1) lock WHERE lock = true;`
 )
 
 // Signifies mutual exclusion could not be obtained.
@@ -33,10 +33,11 @@ var ErrContextCanceled = fmt.Errorf("ErrContextCanceled")
 // taken.
 var ErrMaxLocks = fmt.Errorf("maximum number of locks acquired")
 
-func keyify(key string) int64 {
+func keyify(key string) []byte {
 	h := fnv.New64a()
 	io.WriteString(h, key)
-	return int64(h.Sum64())
+	b := []byte{}
+	return h.Sum(b)
 }
 
 type RequestType int
@@ -241,13 +242,19 @@ func (m *guard) lock(ctx context.Context, key string) response {
 		return response{false, &lctx{done: closedchan, err: ErrMaxLocks}, ErrMaxLocks}
 	}
 
-	var ok bool
-	row := m.conn.QueryRow(ctx, trySessionLock, keyify(key))
-	err := row.Scan(&ok)
+	rr := m.conn.PgConn().ExecParams(ctx,
+		trySessionLock,
+		[][]byte{
+			keyify(key),
+		},
+		nil,
+		[]int16{1},
+		nil)
+	tag, err := rr.Close()
 	if err != nil {
 		return response{false, nil, err}
 	}
-	if !ok {
+	if tag.RowsAffected() == 0 {
 		return response{false, &lctx{done: closedchan, err: ErrMutualExclusion}, ErrMutualExclusion}
 	}
 
@@ -275,12 +282,19 @@ func (m *guard) unlock(ctx context.Context, key string) response {
 		m.counter--
 	}()
 
-	row := m.conn.QueryRow(ctx, trySessionUnlock, keyify(key))
-	err := row.Scan(&ok)
+	rr := m.conn.PgConn().ExecParams(ctx,
+		trySessionUnlock,
+		[][]byte{
+			keyify(key),
+		},
+		nil,
+		[]int16{1},
+		nil)
+	tag, err := rr.Close()
 	if err != nil {
 		return response{false, nil, err}
 	}
-	if !ok {
+	if tag.RowsAffected() == 0 {
 		return response{false, nil, fmt.Errorf("unlock of key %s returned false", key)}
 	}
 	return response{true, nil, nil}

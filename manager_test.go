@@ -98,7 +98,7 @@ func Test_Manager(t *testing.T) {
 	t.Run("CtxChildCancelation", test_CtxChildCancelation)
 	for i := 0; i < 4; i++ {
 		s := strconv.Itoa(i)
-		t.Run("BasicUsage-Run-", test_BasicUsage)
+		t.Run("BasicUsage-Run-"+s, test_BasicUsage)
 		t.Run("Counter-Run-"+s, test_Counter)
 		t.Run("SingleSessionMutualExclusion-Run-"+s, test_SingleSessionMutualExclusion)
 		t.Run("MultiSessionMutualExclusion-Run-"+s, test_MultiSessionMutualExclusion)
